@@ -7,7 +7,24 @@
 //! in-order pass over the values reproduces it to the last bit. Empty bins are
 //! NaN for mean/std/median/min/max and 0 for count/sum, matching scipy.
 
+use std::cmp::Ordering;
+
 use crate::edges::{bin_edges, bin_numbers, data_range};
+
+/// numpy's sort order: every NaN sorts after every real number regardless of its
+/// sign bit, matching `np.argsort` / `np.lexsort`. This is what lets the per-bin
+/// median/min/max reductions agree with scipy on a bin that contains a NaN —
+/// scipy sorts the values and picks positionally, so a NaN in the bin lands at
+/// the high end rather than deciding the result. `total_cmp` alone would order a
+/// negative NaN below `-inf`; numpy keeps all NaN together at the top.
+fn numpy_cmp(a: f64, b: f64) -> Ordering {
+    match (a.is_nan(), b.is_nan()) {
+        (false, false) => a.total_cmp(&b),
+        (false, true) => Ordering::Less,
+        (true, false) => Ordering::Greater,
+        (true, true) => Ordering::Equal,
+    }
+}
 
 /// The statistic to compute per bin.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -156,7 +173,7 @@ fn median(values: &[f64], binnumber: &[usize], nbins: usize) -> Vec<f64> {
     order.sort_by(|&a, &b| {
         binnumber[a]
             .cmp(&binnumber[b])
-            .then(values[a].partial_cmp(&values[b]).unwrap())
+            .then_with(|| numpy_cmp(values[a], values[b]))
     });
 
     let mut out = vec![f64::NAN; flat];
@@ -188,7 +205,7 @@ enum Extreme {
 fn extreme(values: &[f64], binnumber: &[usize], nbins: usize, which: Extreme) -> Vec<f64> {
     let flat = nbins + 2;
     let mut order: Vec<usize> = (0..values.len()).collect();
-    order.sort_by(|&a, &b| values[a].partial_cmp(&values[b]).unwrap());
+    order.sort_by(|&a, &b| numpy_cmp(values[a], values[b]));
     if let Extreme::Min = which {
         order.reverse();
     }
@@ -262,5 +279,85 @@ mod tests {
         assert_eq!(mn.statistic, vec![1.0, 2.0]);
         let mx = binned_statistic(&x, &v, Statistic::Max, 2, Some((0.0, 10.0)));
         assert_eq!(mx.statistic, vec![5.0, 7.0]);
+    }
+
+    /// A NaN inside a bin must not panic; scipy sorts it to the high end, so
+    /// median/min pick the surviving values while mean/std/sum/max propagate NaN.
+    /// Oracle: `binned_statistic([1,1,1,2],[10,nan,30,5], stat, bins=2)`,
+    /// scipy 1.17.1 — bin1 = {10, nan, 30}, bin2 = {5}.
+    #[test]
+    fn nan_in_bin_matches_scipy() {
+        let x = [1.0, 1.0, 1.0, 2.0];
+        let v = [10.0, f64::NAN, 30.0, 5.0];
+
+        let median = binned_statistic(&x, &v, Statistic::Median, 2, None);
+        assert_eq!(median.statistic, vec![30.0, 5.0]);
+
+        let min = binned_statistic(&x, &v, Statistic::Min, 2, None);
+        assert_eq!(min.statistic, vec![10.0, 5.0]);
+
+        let max = binned_statistic(&x, &v, Statistic::Max, 2, None);
+        assert!(max.statistic[0].is_nan());
+        assert_eq!(max.statistic[1], 5.0);
+
+        let count = binned_statistic(&x, &v, Statistic::Count, 2, None);
+        assert_eq!(count.statistic, vec![3.0, 1.0]);
+
+        // A NaN reaches every additive reduction, so bin1 is NaN; bin2 is the
+        // single value 5 (std of one element is 0). Oracle bin2: mean/sum 5, std 0.
+        for (stat, bin2) in [
+            (Statistic::Mean, 5.0),
+            (Statistic::Sum, 5.0),
+            (Statistic::Std, 0.0),
+        ] {
+            let r = binned_statistic(&x, &v, stat, 2, None);
+            assert!(
+                r.statistic[0].is_nan(),
+                "{} bin1 should be NaN",
+                stat.name()
+            );
+            assert_eq!(r.statistic[1], bin2, "{} bin2", stat.name());
+        }
+    }
+
+    /// When a NaN lands on a median middle slot the average is NaN, and `max`
+    /// stays NaN whenever the bin holds a NaN. Oracle bin1 = {5, nan} (even),
+    /// bin2 = {1, 2, 3, nan}.
+    #[test]
+    fn nan_at_median_middle_matches_scipy() {
+        let x = [1.0, 1.0, 2.0, 2.0, 2.0, 2.0];
+        let v = [5.0, f64::NAN, 1.0, 2.0, 3.0, f64::NAN];
+
+        let median = binned_statistic(&x, &v, Statistic::Median, 2, None);
+        assert!(median.statistic[0].is_nan());
+        assert_eq!(median.statistic[1], 2.5);
+
+        let min = binned_statistic(&x, &v, Statistic::Min, 2, None);
+        assert_eq!(min.statistic, vec![5.0, 1.0]);
+
+        let max = binned_statistic(&x, &v, Statistic::Max, 2, None);
+        assert!(max.statistic[0].is_nan());
+        assert!(max.statistic[1].is_nan());
+    }
+
+    /// Empty bins: NaN for mean/std/median/min/max, 0 for count/sum.
+    #[test]
+    fn empty_bins_match_scipy_for_every_statistic() {
+        let x = [0.0, 10.0];
+        let v = [1.0, 2.0];
+        for stat in [
+            Statistic::Mean,
+            Statistic::Std,
+            Statistic::Median,
+            Statistic::Min,
+            Statistic::Max,
+        ] {
+            let r = binned_statistic(&x, &v, stat, 3, Some((0.0, 10.0)));
+            assert!(r.statistic[1].is_nan(), "{} middle bin", stat.name());
+        }
+        let count = binned_statistic(&x, &v, Statistic::Count, 3, Some((0.0, 10.0)));
+        assert_eq!(count.statistic[1], 0.0);
+        let sum = binned_statistic(&x, &v, Statistic::Sum, 3, Some((0.0, 10.0)));
+        assert_eq!(sum.statistic[1], 0.0);
     }
 }

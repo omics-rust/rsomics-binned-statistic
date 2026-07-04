@@ -1,6 +1,6 @@
 [package]
 name = "rsomics-binned-statistic"
-version = "0.1.0"
+version = "0.1.1"
 description = "Per-bin statistic of a second variable (mean/std/median/count/sum/min/max) — value-exact to scipy.stats.binned_statistic"
 edition = "2024"
 rust-version = "1.85"

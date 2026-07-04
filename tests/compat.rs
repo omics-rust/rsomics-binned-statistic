@@ -52,6 +52,7 @@ fn dataset(name: &str) -> (Vec<f64>, Vec<f64>) {
     match name {
         "small.tsv" => parse_table(include_bytes!("golden/small.tsv")).unwrap(),
         "empty.tsv" => parse_table(include_bytes!("golden/empty.tsv")).unwrap(),
+        "nan.tsv" => parse_table(include_bytes!("golden/nan.tsv")).unwrap(),
         "lcg5000" => (
             lcg_vec(5000, SEED_X, 100.0, 0.0),
             lcg_vec(5000, SEED_V, 1000.0, -500.0),
